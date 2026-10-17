@@ -1,0 +1,21 @@
+# Patch layer contributed by dsh-plugin-messaging.
+#
+# Adds one host-side row to the web profile: the multi-platform messaging bridge.
+# Everything else in the bundle is inherited untouched.
+#
+# Configure by patching this row's config in the profile's own cordis.patch.yml, e.g.
+#
+#   - id: messaging-bridge
+#     config:
+#       enabled: true
+#       platform: telegram          # line | telegram | whatsapp | discord
+#       replyLanguage: th           # en (default) | zh | th
+#       telegram:
+#         botToken: "123:ABC"       # or export TELEGRAM_BOT_TOKEN
+#         allowedUserIds: ["999"]
+#
+# Secrets are best supplied via env (see *Env fields in the schema) rather than
+# committed to the profile.
+- insert:
+    - id: messaging-bridge
+      name: dsh-plugin-messaging
