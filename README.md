@@ -16,12 +16,15 @@ web client.
 
 | Feature | How |
 |---|---|
-| Reply in a chosen language | `replyLanguage` = `en` (default) / `zh` / `th`. **Only the bridge's own messages** (status, errors, "no answer", max-token/length notices, command replies, truncation suffix) are translated — **the AI's answer is always sent verbatim**. On-disk cache (`เก็บไว้`), free Google endpoint, no key. `/lang en\|zh\|th` overrides per chat. |
+| Reply in a chosen language | `replyLanguage` = `en` (default) / `zh` / `th`, picked in the **top-right corner** of `Settings → Messaging` — the choice is written the moment you select it and applies to the next answer, no Save button, no restart (a chat that once used `/lang` keeps its own override). **Only the bridge's own messages** (status, errors, "no answer", max-token/length notices, command replies, truncation suffix) are translated — **the AI's answer is always sent verbatim**. On-disk cache (`เก็บไว้`), free Google endpoint, no key. `/lang en\|zh\|th` overrides per chat. |
 | Chunk long replies | `maxCharsPerMessage` budget, `maxChunksPerReply` cap (default 3), platform hard limit (LINE 5000 · Telegram/WhatsApp 4096). Prefers paragraph → line → space boundaries. |
 | Monthly counter | `/count` — inbound / outbound / real messages / push (metered) / reply (free) / translated, per `YYYY-MM`, auto-rolls over. Doubles as a LINE cost meter (push is metered). |
 | AI working-status | On edit-capable platforms (Telegram `editMessageText`, LINE loading) the status message updates with `🤖 Thinking… Ns` (translated), then is replaced by the answer. Footer shows `⏱ Ns · M t/s`. |
-| Commands | `/new /current /stop /lang /count /status /sessions /use /quota /help` |
-| Settings UI | `Settings → Messaging`: platform picker, reply-language picker, translate backend, per-platform token/group/webhook fields, chunking + counter toggles. Writes the plugin Config via the host `settings` RPC. |
+| Commands | `/new /current /stop /lang /count /status /sessions /use /quota /access /tools /help` |
+| Chat-side permission switch | `/access read\|write\|full` (aliases `/perm`, bare `/access` = status) maps onto the host's permission presets `read-only` / `workspace-write` / `danger-full-access` and switches them for **this chat's session** through `permissionPresets` + `approval.setPolicy` — the same path as the built-in `/permission` command, so the composer picker and the running agent update at once. The AI can also *ask*: a scoped `request_access` tool pushes a message into the chat ("reply `/access write` to grant"), and **nothing changes until the user types it**. `accessCommands` / `aiAccessRequest` toggles. |
+| MCP on/off from chat | `/tools` lists every MCP server the **dsh-mcp-manager-plus** page shows; `/tools <name> on\|off` (also `เปิด`/`ปิด`) toggles one through that plugin's loopback API (`GET /servers`, `POST /toggle`), so the patch file keeps a single writer and its live reload does the rest. Names match exactly, then by unique substring; built-in providers are refused. `mcpCommands` toggle. |
+| Keep a channel listening | Every platform card leads with a **Keep the connection open** checkbox (`line.keepOpen` / `telegram.keepOpen` / `wa.keepOpen`, default off). Ticked, that channel keeps its webhook route registered / its Telegram long-poll running **even when another platform is selected**, so it stays reachable and answers messages arriving there; un-ticking disposes the route / ends the poll. Both directions apply on save, live — the bridge reconciles its connections on `loader/volatile-update`, so nothing has to restart. |
+| Settings UI | `Settings → Messaging`: plugin title on the left with the reply-language menu top-right, platform picker, translate backend, per-platform token/group/webhook fields, chunking + counter toggles. Writes the plugin Config through the host `settings` RPC. Every editable leaf is `.volatile()`, so a save is committed into the *running* plugin (`loader/volatile-update`) instead of remounting it — the bridge reads its config through those live refs. Live: language, keep-open boxes, `enabled` (off closes every connection), chunk budgets, footer/broadcast toggles. Needs a restart: tokens, allowlists, `receiveMode`, webhook paths, `translateBackend` (adapters read them when they start). |
 
 ---
 
@@ -117,6 +120,18 @@ messaging-bridge:
 ```
 
 Point the LINE Developers webhook at `https://your-tunnel.example.com/plugins/messaging/line/webhook`.
+
+**Keep more than one channel reachable at the same time** (the checkbox at the top of
+each platform card, applied live when you tick it):
+
+```yaml
+messaging-bridge:
+  platform: line          # the channel the AI "belongs" to by default
+  telegram:
+    keepOpen: true        # Telegram keeps long-polling and answers too
+  wa:
+    keepOpen: true        # WhatsApp webhook route stays registered
+```
 
 **WhatsApp (webhook-only, public HTTPS + Meta Graph API):**
 

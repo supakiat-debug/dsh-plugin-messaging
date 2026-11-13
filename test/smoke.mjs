@@ -12,7 +12,7 @@ import { sysText, labels, MESSAGES, LABELS } from '../lib/messages.js'
 import { BindingStore } from '../lib/state.js'
 import { MonthlyCounter } from '../lib/counter.js'
 import { findPromptSeq, extractReply } from '../lib/reply.js'
-import { resolveConfig, Config } from '../lib/config.js'
+import { resolveConfig, Config, wantedPlatforms } from '../lib/config.js'
 
 let pass = 0, fail = 0
 const t = (name, fn) => {
@@ -209,7 +209,7 @@ await t('client: registers via __ModuleLoader__ and exports apply/inject', async
 
   // Write path: diffOps recurses containers (never sets a whole non-volatile
   // object) and guards secrets so a blank field never wipes a stored token.
-  const { diffOps, isSecretPath } = ex.__internals
+  const { diffOps, isSecretPath, PLATFORM_FIELDS } = ex.__internals
   assert.ok(isSecretPath(['telegram', 'botToken']) && isSecretPath(['line', 'channelSecret']))
   assert.ok(!isSecretPath(['telegram', 'receiveMode']) && !isSecretPath(['wa', 'verifyToken']))
   assert.deepEqual(diffOps({}, { telegram: { botToken: 'TOK' } }, [], isSecretPath),
@@ -220,6 +220,18 @@ await t('client: registers via __ModuleLoader__ and exports apply/inject', async
   assert.deepEqual(diffOps({ publicBaseUrl: 'http://x' }, { publicBaseUrl: '' }, [], isSecretPath),
     [{ op: 'set', path: ['publicBaseUrl'], value: '' }], 'non-secret empty -> clears')
   assert.deepEqual(diffOps({ enabled: true }, { enabled: true }, [], isSecretPath), [], 'unchanged -> no op')
+
+  // Each channel card is LED by the live "Keep the connection open" box, and that
+  // box saves itself (immediate) because the bridge reacts without a restart.
+  for (const p of ['line', 'telegram', 'whatsapp']) {
+    const f = (PLATFORM_FIELDS[p] || [])[0]
+    assert.ok(f && f.check === true && f.label === 'Keep the connection open', `${p} leads with the keep-open box`)
+    assert.equal(f.immediate, true, `${p} saves on toggle`)
+    assert.ok(typeof f.hint === 'string' && f.hint.includes('มีผลทันที'), `${p} hint says live`)
+  }
+  assert.deepEqual(PLATFORM_FIELDS.line[0].path, ['line', 'keepOpen'])
+  assert.deepEqual(PLATFORM_FIELDS.telegram[0].path, ['telegram', 'keepOpen'])
+  assert.deepEqual(PLATFORM_FIELDS.whatsapp[0].path, ['wa', 'keepOpen'], 'whatsapp writes the wa config key')
   delete globalThis.window
 })
 
@@ -276,6 +288,48 @@ await t('config: resolveConfig unwraps live Volatile refs (cordis apply input)',
   assert.deepEqual(c.telegram.allowedChatIds, ['1'])
   assert.equal(c.telegram.receiveMode, 'longpoll', 'unconfigured nested default kept')
   assert.equal(c.line.webhookPath, '/plugins/messaging/line/webhook', 'untouched sub-object defaults')
+})
+await t('config: keepOpen defaults off; wantedPlatforms = primary + kept-open channels', () => {
+  const c = resolveConfig({})
+  assert.equal(c.line.keepOpen, false)
+  assert.equal(c.telegram.keepOpen, false)
+  assert.equal(c.wa.keepOpen, false)
+  assert.deepEqual(wantedPlatforms(c), ['line'])
+  assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'telegram', line: { keepOpen: true }, wa: { keepOpen: true } })),
+    ['telegram', 'line', 'whatsapp'], 'primary first, then each kept-open channel')
+  assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'whatsapp', wa: { keepOpen: true } })),
+    ['whatsapp'], 'primary already kept open is not duplicated')
+  assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'line', broadcast: { enabled: true } })),
+    ['line', 'telegram', 'whatsapp'], 'broadcast still runs everything')
+})
+await t('config: resolved view reads THROUGH the live refs, so a save lands without a restart', () => {
+  // Stand-in for the Volatile refs cordis owns: .get() always returns the current
+  // value, and the loader commits a settings save by swapping that value in place.
+  const ref = (v) => ({ get: () => v, set(next) { v = next } })
+  const live = {
+    enabled: ref(true),
+    platform: ref('telegram'),
+    replyLanguage: ref('en'),
+    telegram: { keepOpen: ref(false) },
+    broadcast: { enabled: ref(false) },
+  }
+  const cfg = resolveConfig(live)
+  assert.equal(cfg.replyLanguage, 'en')
+  assert.deepEqual(wantedPlatforms(cfg), ['telegram'])
+  live.replyLanguage.set('th')
+  live.telegram.keepOpen.set(true)
+  assert.equal(cfg.replyLanguage, 'th', 'language picked in the settings page applies to the running bridge')
+  assert.equal(cfg.telegram.keepOpen, true)
+  assert.equal(cfg.wa.keepOpen, false, 'a channel the host never sent keeps its default')
+  assert.deepEqual(wantedPlatforms(cfg), ['telegram'], 'a channel kept open that is already primary is not duplicated')
+  live.wa = { keepOpen: ref(true) }
+  assert.deepEqual(wantedPlatforms(cfg), ['telegram', 'whatsapp'], 'a sub-object the host starts sending is picked up too')
+  live.broadcast.enabled.set(true)
+  assert.deepEqual(wantedPlatforms(cfg), ['line', 'telegram', 'whatsapp'], 'broadcast flip is live too')
+  // A plain object (tests, hand-written config) stays a plain snapshot.
+  const plain = resolveConfig({ replyLanguage: 'zh' })
+  assert.equal(plain.replyLanguage, 'zh')
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(plain))).length > 10, true, 'serializable')
 })
 await t('telegram adapter: allowlist matches numeric id AND username (@optional, case-insensitive)', async () => {
   const { createTelegramAdapter } = await import('../lib/adapters/telegram.js')
@@ -451,6 +505,301 @@ await t('telegram adapter: escapes <tags> (never a 400 entity error) and retries
   } finally {
     if (adapter) await adapter.stop()
     globalThis.fetch = realFetch
+  }
+})
+
+await t('commands: /access and /tools parse (aliases included)', () => {
+  assert.deepEqual(parseCommand('/access full'), { type: 'access', arg: 'full' })
+  assert.deepEqual(parseCommand('/perm'), { type: 'access', arg: '' })
+  assert.deepEqual(parseCommand('/tools'), { type: 'tools', arg: '' })
+  assert.deepEqual(parseCommand('/mcp laya off'), { type: 'tools', arg: 'laya off' })
+})
+
+await t('permissions: aliases map onto presets; knobs written through both services', async () => {
+  const { ACCESS_LEVELS, accessLevel, accessSupported, accessState, applyAccess, permissionService, approvalService } = await import('../lib/permissions.js')
+  assert.deepEqual(ACCESS_LEVELS.map((l) => l.preset), ['read-only', 'workspace-write', 'danger-full-access'], 'the three dsh-base presets')
+  assert.equal(accessLevel('FULL')?.preset, 'danger-full-access')
+  assert.equal(accessLevel(' w ')?.preset, 'workspace-write')
+  assert.equal(accessLevel('ro')?.key, 'read')
+  assert.equal(accessLevel('banana'), null)
+
+  const PRESETS = { 'read-only': ['read-only', 'ask'], 'workspace-write': ['workspace-write', 'ask'], 'danger-full-access': ['danger-full-access', 'never'] }
+  const kn = { sandbox: 'workspace-write', approval: 'ask' }
+  const notified = []
+  const pp = {
+    names: Object.keys(PRESETS),
+    permissionState: () => ({ ...kn }),
+    current: () => Object.keys(PRESETS).find((n) => PRESETS[n][0] === kn.sandbox && PRESETS[n][1] === kn.approval) ?? 'custom',
+    apply: (_s, name, setApproval) => {
+      const [sb, ap] = PRESETS[name]
+      kn.sandbox = sb
+      if (ap !== kn.approval) setApproval(ap)
+      kn.approval = ap
+    },
+    set: (_s, name) => { const [sb, ap] = PRESETS[name]; kn.sandbox = sb; kn.approval = ap },
+  }
+  const approval = { config: { policy: 'ask' }, setPolicy: (_a, p) => { notified.push(p) } }
+  const ctx = { get: (n) => (n === 'permissionPresets' ? pp : n === 'approval' ? approval : n === 'shell' ? { sandboxMode: 'workspace-write' } : undefined) }
+  assert.equal(permissionService(ctx), pp, 'service resolves under its camelCase key')
+  assert.equal(approvalService(ctx), approval)
+  assert.equal(accessSupported(pp, accessLevel('full')), true)
+  assert.equal(accessSupported({ names: ['safe-only'] }, accessLevel('full')), false, 'renamed catalog cannot be escalated to')
+
+  const st = applyAccess(pp, approval, ctx, { session: {} }, accessLevel('full'))
+  assert.deepEqual([kn.sandbox, kn.approval], ['danger-full-access', 'never'])
+  assert.deepEqual(notified, ['never'], 'approval knob goes through the approval service (live agent notified now)')
+  assert.equal(st.preset, 'danger-full-access')
+  assert.equal(accessState(pp, ctx, { session: {} }).sandbox, 'danger-full-access')
+  assert.equal(applyAccess(pp, null, ctx, { session: {} }, accessLevel('read')).preset, 'read-only', 'no approval service → durable setter path')
+  assert.equal(permissionService({ get: () => undefined }), null, 'host without the service degrades instead of throwing')
+})
+
+await t('mcpctl: loopback manager calls, row-id toggle, builtin refusal', async () => {
+  const { mcpList, mcpSet, matchServer } = await import('../lib/mcpctl.js')
+  const servers = [
+    { id: 'mcp-laya', serverName: 'laya', source: 'user', enabled: true, live: { toolCount: 3 } },
+    { id: 'mcp-mcp-comfy', serverName: 'mcp-comfy', source: 'user', enabled: false, live: { toolCount: 0 } },
+    { id: '', serverName: 'computer-use', source: 'builtin', enabled: true, live: { toolCount: 1 } },
+  ]
+  const calls = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    calls.push({ u, init })
+    if (u.includes('/servers')) return { ok: true, status: 200, text: async () => JSON.stringify({ servers }) }
+    if (u.includes('/toggle')) {
+      const body = JSON.parse(init.body)
+      // The real manager re-reads the patch it just wrote, so the next list
+      // reflects the toggle — mutate the fixture the same way.
+      for (const s of servers) if (s.id === body.id) s.enabled = body.enabled === true
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, action: body.enabled ? 'enabled' : 'disabled' }) }
+    }
+    return { ok: false, status: 404, text: async () => JSON.stringify({ error: 'nope' }) }
+  }
+  const ctx = { get: (n) => (n === 'webServer' ? { port: 3080 } : undefined) }
+  try {
+    assert.equal((await mcpList(ctx)).length, 3)
+    assert.equal(calls[0].u, 'http://127.0.0.1:3080/mcp-manager-plus/servers?lang=en', 'same-host loopback URL')
+    assert.deepEqual(await mcpSet(ctx, 'laya', false), { name: 'laya', action: 'disabled' })
+    const toggleCall = calls.find((c) => c.u.endsWith('/toggle'))
+    assert.deepEqual(JSON.parse(toggleCall.init.body), { id: 'mcp-laya', enabled: false }, 'toggle addresses the patch ROW ID')
+    assert.equal(toggleCall.init.method, 'POST')
+    assert.equal((await mcpSet(ctx, 'comfy', true)).action, 'enabled', 'unique substring resolves')
+    assert.equal((await mcpSet(ctx, 'laya', false)).unchanged, true, 'already off → no write')
+    assert.equal((await mcpSet(ctx, 'computer', true)).builtin, true, 'built-in providers are refused')
+    const miss = await mcpSet(ctx, 'banana', true)
+    assert.equal(miss.missing, true)
+    assert.ok(miss.known.includes('laya'), 'known names come back for the reply')
+    await assert.rejects(() => mcpSet({ get: () => undefined }, 'laya', false), /not listening/, 'no webServer port → clear error')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  assert.equal(matchServer(servers, 'm').ambiguous.length, 2, 'ambiguous matches are reported, not guessed')
+})
+
+await t('bridge: /access switches the session, /tools drives the manager, request_access only asks', async () => {
+  const { createBridge } = await import('../lib/bridge.js')
+  const PRESETS = { 'read-only': ['read-only', 'ask'], 'workspace-write': ['workspace-write', 'ask'], 'danger-full-access': ['danger-full-access', 'never'] }
+  const kn = { sandbox: 'read-only', approval: 'ask' }
+  const notified = []
+  const pp = {
+    names: Object.keys(PRESETS),
+    permissionState: () => ({ ...kn }),
+    current: () => Object.keys(PRESETS).find((n) => PRESETS[n][0] === kn.sandbox && PRESETS[n][1] === kn.approval) ?? 'custom',
+    apply: (_s, name, setApproval) => {
+      const [sb, ap] = PRESETS[name]
+      kn.sandbox = sb
+      if (ap !== kn.approval) setApproval(ap)
+      kn.approval = ap
+    },
+    set: (_s, name) => { const [sb, ap] = PRESETS[name]; kn.sandbox = sb; kn.approval = ap },
+  }
+  const servers = [{ id: 'mcp-laya', serverName: 'laya', source: 'user', enabled: true, live: { toolCount: 3 } }]
+  const http = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    http.push({ u, init })
+    if (u.includes('/toggle')) http.push({ toggled: JSON.parse(init.body) })
+    if (u.includes('/servers')) return { ok: true, status: 200, text: async () => JSON.stringify({ servers }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, action: 'disabled' }) }
+  }
+  const tools = []
+  const pushes = []
+  const makeAgent = () => {
+    const events = []
+    let seq = 0
+    return {
+      session: { id: 'session-access-test', snapshotEvents: () => events, requestHeader: () => ({ config: {} }) },
+      followup: (msg) => {
+        const s = msg.source || {}
+        events.push({ seq: ++seq, type: 'user/message', data: { source: { platform: s.platform, messageId: s.messageId } } })
+        events.push({ seq: ++seq, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } })
+        events.push({ seq: ++seq, type: 'turn/end', data: { reason: { kind: 'end_turn' } } })
+      },
+      whenIdle: async () => {}, inject: () => {}, cancel: () => {},
+    }
+  }
+  const agent = makeAgent()
+  const ctx = {
+    get: (name) => {
+      if (name === 'permissionPresets') return pp
+      if (name === 'approval') return { config: { policy: 'ask' }, setPolicy: (_a, p) => notified.push(p) }
+      if (name === 'shell') return { sandboxMode: 'read-only' }
+      if (name === 'webServer') return { port: 3080 }
+      if (name === 'agentPresets') return { resolve: async (id) => ({ id: id ?? 'default' }), mount: async () => {} }
+      if (name === 'agentDefaultModel') return { currentSelection: () => ({}) }
+      if (name === 'sessions') return { flush: async () => {} }
+      if (name === 'sessionTitle') return { rename: () => {} }
+      return undefined
+    },
+    agents: {
+      create: async (opts) => { if (opts.setup) await opts.setup({ tools: { register: (d) => tools.push(d) } }, agent); return { agent } },
+      get: () => agent,
+      resume: async () => { throw new Error('no resume in test') },
+    },
+  }
+  const cfg = resolveConfig({ enabled: true, platform: 'telegram', replyLanguage: 'en', translateBackend: 'off', counterEnabled: false, showStatsFooter: false })
+  const store = new BindingStore(join(tmp, 'acc-state.json'), () => {})
+  const counter = new MonthlyCounter(join(tmp, 'acc-counter.json'), () => {})
+  const translator = createTranslator({ backend: 'off', cacheFile: join(tmp, 'acc-tr.json') })
+  const bridge = createBridge({
+    cfg, ctx, store, counter, translator, log: () => {},
+    adapters: { telegram: { send: async (chatId, chunks) => pushes.push({ chatId, chunks }) } },
+  })
+  const sent = []
+  const say = async (text, messageId) => {
+    sent.length = 0
+    await bridge.onInbound({
+      platform: 'telegram', chatId: '555', userId: '555', text, isGroup: false, messageId,
+      send: async (chunks) => { sent.push(...chunks); return { kind: 'push' } },
+      typing: () => {},
+    })
+    return sent.join('\n')
+  }
+  try {
+    // A normal turn primes the session AND registers the scoped tool on it.
+    await say('hello', 1)
+    assert.equal(tools.length, 1, 'one scoped tool registered')
+    const tool = tools[0]
+    assert.equal(tool.name, 'request_access')
+    assert.deepEqual(tool.parameters.properties.level.enum, ['read', 'write', 'full'])
+    assert.ok(typeof tool.output.render === 'function' && typeof tool.execute === 'function')
+
+    // The AI asks: a message lands in the chat, and NO knob moves.
+    const asked = await tool.execute({ level: 'write', reason: 'need to write the report file' }, { agent })
+    assert.equal(asked.sent, true)
+    assert.equal(pushes.length, 1, 'pushed into the chat that drives this session')
+    assert.equal(pushes[0].chatId, '555')
+    assert.ok(pushes[0].chunks[0].includes('/access write'), 'the ask carries the granting command')
+    assert.ok(pushes[0].chunks[0].includes('need to write the report file'), 'the model reason is shown verbatim')
+    assert.deepEqual([kn.sandbox, kn.approval], ['read-only', 'ask'], 'asking never escalates anything')
+
+    // The user grants it by hand.
+    const granted = await say('/access write', 2)
+    assert.ok(granted.includes('Access = write'), granted)
+    assert.deepEqual([kn.sandbox, kn.approval], ['workspace-write', 'ask'])
+    assert.deepEqual(notified, [], 'no approval-knob change was needed (ask → ask)')
+    assert.ok((await say('/access', 3)).includes('workspace-write'), 'bare /access reports the state')
+    assert.ok((await say('/access banana', 4)).includes('/access write'), 'bad level shows usage')
+
+    // /tools: list, then toggle through the manager API.
+    const list = await say('/tools', 5)
+    assert.ok(list.includes('laya') && list.includes('✅'), list)
+    const off = await say('/tools laya off', 6)
+    assert.ok(off.includes('laya') && off.includes('disabled'), off)
+    const toggle = http.find((c) => c.toggled)
+    assert.deepEqual(toggle.toggled, { id: 'mcp-laya', enabled: false }, 'toggle posts the row id + a real boolean')
+    assert.ok((await say('/tools banana on', 7)).includes('laya'), 'unknown name lists what exists')
+    assert.ok((await say('/tools off', 8)).includes('/tools <name>'), 'flag without a name shows usage')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+await t('index: keepOpen opens that channel on save and closes it again — no restart', async () => {
+  const { apply } = await import('../lib/index.js')
+  const ref = (v) => ({ get: () => v, set(next) { v = next } })
+  const live = {
+    enabled: ref(true),
+    platform: ref('line'),
+    replyLanguage: ref('en'),
+    translateBackend: ref('off'),
+    stateFile: ref(join(tmp, 'idx-state.json')),
+    counterFile: ref(join(tmp, 'idx-counter.json')),
+    line: { channelAccessToken: ref('LTOK'), channelSecret: ref(''), webhookPath: ref('/plugins/messaging/line/webhook') },
+    // botTokenEnv points at a variable that cannot exist, so an empty token really
+    // means "idle" no matter what the machine running the tests has exported.
+    telegram: { botToken: ref(''), botTokenEnv: ref('DSH_TEST_NO_TELEGRAM_TOKEN'), keepOpen: ref(false) },
+    wa: { accessToken: ref(''), accessTokenEnv: ref('DSH_TEST_NO_WA_TOKEN'), phoneNumberId: ref('') },
+    broadcast: { enabled: ref(false) },
+  }
+  const routes = []
+  const handlers = []
+  let cleanup
+  const ctx = {
+    baseUrl: 'file:///' + join(tmp, 'idx').replace(/\\/g, '/'),
+    logger: { info: () => {}, warn: () => {} },
+    get: (name) => {
+      if (name === 'loader') return { await: async () => {} }
+      if (name === 'webServer') return { register: (r) => { routes.push(r.path); return () => { const i = routes.indexOf(r.path); if (i >= 0) routes.splice(i, 1) } } }
+      return undefined
+    },
+    on: (_event, fn) => { handlers.push(fn) },
+    effect: (fn) => { cleanup = fn() },
+  }
+  const lines = []
+  const realLog = console.log
+  const realWarn = console.warn
+  console.log = (...a) => lines.push(a.join(' '))
+  console.warn = (...a) => lines.push(String(a[0]))
+  const say = (paths) => handlers.forEach((fn) => fn(paths))
+  const has = (needle) => lines.filter((l) => l.includes(needle)).length
+  const settle = async (needle, expect = 1) => {
+    for (let i = 0; i < 50 && has(needle) < expect; i++) await new Promise((r) => setTimeout(r, 10))
+    return has(needle)
+  }
+  try {
+    apply(ctx, live)
+    await settle('messaging-bridge listening')
+    assert.deepEqual(routes, ['/plugins/messaging/line/webhook'], 'boot opens only the primary channel')
+    assert.equal(has('telegram: no bot token'), 0, 'the kept-shut channel is not running')
+
+    // Tick "Keep the connection open" on Telegram, then the settings save commits the
+    // volatile value and the loader pokes us — the bridge must open it by itself.
+    live.telegram.keepOpen.set(true)
+    say([['telegram', 'keepOpen']])
+    assert.equal(await settle('telegram: no bot token'), 1, 'telegram opened live (idle here only because it has no token)')
+
+    // An unrelated save (the header language) must not touch any connection.
+    live.replyLanguage.set('th')
+    say([['replyLanguage']])
+    await new Promise((r) => setTimeout(r, 40))
+    assert.equal(has('messaging-bridge listening'), 2, 'non-channel config paths are ignored')
+    assert.equal(has('telegram: no bot token'), 1, 'and never restart an open channel')
+
+    // Un-tick → close just that channel; the primary keeps its webhook.
+    live.telegram.keepOpen.set(false)
+    say([['telegram', 'keepOpen']])
+    assert.equal(await settle('telegram: connection closed (settings saved)'), 1)
+    assert.deepEqual(routes, ['/plugins/messaging/line/webhook'], 'the primary channel stays open')
+
+    // Switching the bridge off in the Settings page is volatile too — it must close
+    // the last connection live, and switching it back on must re-open it.
+    live.enabled.set(false)
+    say([['enabled']])
+    for (let i = 0; i < 50 && routes.length; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.deepEqual(routes, [], 'un-ticking enabled closes everything, no restart')
+    live.enabled.set(true)
+    say([['enabled']])
+    for (let i = 0; i < 50 && !routes.length; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.deepEqual(routes, ['/plugins/messaging/line/webhook'], 'ticking it back opens the primary channel again')
+
+    cleanup()
+    assert.deepEqual(routes, [], 'teardown disposes every route we registered')
+  } finally {
+    console.log = realLog
+    console.warn = realWarn
   }
 })
 
