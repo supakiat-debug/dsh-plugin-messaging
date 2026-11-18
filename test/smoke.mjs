@@ -267,13 +267,15 @@ const collect = (node, acc = { texts: [], selects: [] }) => {
   if (typeof node === 'string') { acc.texts.push(node); return acc }
   if (typeof node !== 'object') return acc
   for (const k of Object.keys(node.props || {})) {
+    // `key` and `className` are plumbing, not copy — and a list key holds a raw STR
+    // id, which the "no STR id leaks onto the page" check below must not trip over.
+    if (k === 'key' || k === 'className') continue
     const v = node.props[k]
     if (typeof v === 'string') acc.texts.push(v)
   }
   if (node.type === 'Select') acc.selects.push(node.props)
   return collect(node.children, acc)
-}
-// Minimal stateful React: useConfig's two useState hooks are pre-seeded (ready +
+}// Minimal stateful React: useConfig's two useState hooks are pre-seeded (ready +
 // draft) so Section renders the full page synchronously; useEffect is a no-op, so
 // the async load() never runs and the render is deterministic.
 const renderPage = (draft) => {
@@ -363,9 +365,47 @@ await t('client: every UI string exists in all three languages', () => {
   }
 })
 
+await t('client: every string id the page asks for exists in STR', () => {
+  const { STR } = renderPage({ ...PAGE, replyLanguage: 'en' }).api.__internals
+  const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const used = new Set()
+  for (const m of src.matchAll(/\bt\(\s*'([A-Za-z0-9]+)'/g)) used.add(m[1])
+  // The per-platform guidance block holds bare string ids that are rendered via t(id).
+  const start = src.indexOf('const notes = platform ===')
+  assert.ok(start > 0, 'the per-platform notes block is still there')
+  const blank = src.indexOf('\n\n', start)
+  const block = src.slice(start, blank > start ? blank : start + 600)
+  const NOT_KEYS = new Set(['line', 'telegram', 'whatsapp', 'discord', 'messenger'])
+  for (const m of block.matchAll(/'([a-z][A-Za-z0-9]*)'/g)) {
+    if (!NOT_KEYS.has(m[1]) && !m[1].startsWith('mb_')) used.add(m[1])
+  }
+  // A typo here is invisible until someone opens that card: t() falls back to
+  // printing the id itself, which is exactly what this test prevents.
+  const missing = [...used].filter((k) => !STR[k])
+  assert.deepEqual(missing, [], `unknown STR ids referenced by the page: ${missing.join(', ')}`)
+  assert.ok(used.size > 40, `the scan only found ${used.size} ids — the regex has gone stale`)
+})
+await t('client: the Discord and Messenger cards render in all three languages', () => {
+  const { STR, makeT } = renderPage({ ...PAGE, replyLanguage: 'en' }).api.__internals
+  const camel = Object.keys(STR).filter((id) => /[a-z][A-Z]/.test(id) && id.length > 6)
+  for (const [p, noteKey] of [['discord', 'discordNote'], ['messenger', 'windowNote']]) {
+    for (const code of ['th', 'en', 'zh']) {
+      const acc = renderPage({ ...PAGE, platform: p, replyLanguage: code })
+      const name = p === 'discord' ? 'Discord' : 'Messenger'
+      assert.ok(acc.text.includes(name), `${p}/${code}: the card names its transport`)
+      assert.ok(acc.text.includes(makeT(code)(noteKey).slice(0, 24)), `${p}/${code}: ${noteKey} guidance is on the card`)
+      assert.ok(acc.text.includes('Keep the connection open'), `${p}/${code}: keep-open box present`)
+      if (code === 'en') assert.ok(!THAI.test(acc.text) && !HAN.test(acc.text), `${p}/en: no Thai, no Chinese`)
+      if (code === 'th') assert.ok(THAI.test(acc.text) && !HAN.test(acc.text), `${p}/th: Thai, and no Chinese`)
+      if (code === 'zh') assert.ok(HAN.test(acc.text) && !THAI.test(acc.text), `${p}/zh: Chinese, and no Thai`)
+      // A missing translation prints its own key; English prose never contains CamelCase.
+      for (const id of camel) assert.ok(!acc.text.includes(id), `${p}/${code}: STR id "${id}" leaked as text`)
+    }
+  }
+})
+
 // ---- config ----
-await t('config: resolveConfig({}) fills defaults', () => {
-  const c = resolveConfig({})
+await t('config: resolveConfig({}) fills defaults', () => {  const c = resolveConfig({})
   assert.equal(c.platform, 'line')
   assert.equal(c.replyLanguage, 'en')
   assert.equal(c.translateBackend, 'google')
