@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-messaging",
-  "version": "0.1.0",
-  "description": "Multi-platform messaging bridge for DeepSeek Harness: chat with your dsh sessions from LINE / Telegram / WhatsApp / Discord, with a Settings menu, per-platform config, reply-language translation (EN/中文/ไทย), monthly message counter, and AI working-status.",
+  "version": "0.2.0",
+  "description": "Multi-platform messaging bridge for DeepSeek Harness: chat with your dsh sessions from LINE / Telegram / WhatsApp / Discord / Facebook Messenger, with a Settings menu, per-platform config, broadcast to every connected chat, reply-language translation (EN/中文/ไทย), monthly message counter, and AI working-status.",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -45,6 +45,9 @@
     "telegram",
     "whatsapp",
     "discord",
+    "messenger",
+    "facebook-messenger",
+    "broadcast",
     "bridge"
   ],
   "engines": {

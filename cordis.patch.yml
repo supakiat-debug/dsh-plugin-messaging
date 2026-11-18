@@ -8,11 +8,16 @@
 #   - id: messaging-bridge
 #     config:
 #       enabled: true
-#       platform: telegram          # line | telegram | whatsapp | discord
+#       platform: telegram          # line | telegram | whatsapp | discord | messenger
 #       replyLanguage: th           # en (default) | zh | th
 #       telegram:
 #         botToken: "123:ABC"       # or export TELEGRAM_BOT_TOKEN
 #         allowedUserIds: ["999"]
+#       discord:
+#         botToken: "MTI3..."       # or export DISCORD_BOT_TOKEN (no public URL needed)
+#       broadcast:
+#         enabled: true             # copy answers to the other listening channels
+#         platforms: [discord]
 #
 # Secrets are best supplied via env (see *Env fields in the schema) rather than
 # committed to the profile.

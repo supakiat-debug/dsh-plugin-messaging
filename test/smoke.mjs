@@ -1,6 +1,8 @@
 // smoke.mjs — dependency-free unit tests for the pure modules.
 // Run: node ./test/smoke.mjs
 import assert from 'node:assert/strict'
+import { createHmac } from 'node:crypto'
+import { Readable } from 'node:stream'
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -46,7 +48,12 @@ await t('chunk: default notice is English (AI text never translated)', () => {
   const out = chunkReply('word '.repeat(2000), 100, 2, 5000)
   assert.ok(out[1].includes('truncated'))
 })
-await t('chunk: hard limits map', () => assert.equal(HARD_LIMITS.telegram, 4096))
+await t('chunk: hard limits map', () => {
+  assert.equal(HARD_LIMITS.telegram, 4096)
+  assert.equal(HARD_LIMITS.whatsapp, 4096)
+  assert.equal(HARD_LIMITS.discord, 2000, 'Discord rejects a message over 2000 characters')
+  assert.equal(HARD_LIMITS.messenger, 2000, 'Messenger rejects a message over 2000 characters')
+})
 
 // ---- translate ----
 await t('translate: google backend + cache + skip-same-lang', async () => {
@@ -185,9 +192,12 @@ await t('modules: full graph imports (index + bridge + adapters)', async () => {
 })
 
 // ---- client bundle ----
+// The bundle registers itself with the module loader exactly once (ESM cache), so
+// keep the definition around for the language / rendering test below.
+let CLIENT_DEF = null
 await t('client: registers via __ModuleLoader__ and exports apply/inject', async () => {
   const captured = {}
-  globalThis.window = { __ModuleLoader__: { load: (def) => { captured.def = def } } }
+  globalThis.window = { __ModuleLoader__: { load: (def) => { captured.def = CLIENT_DEF = def } } }
   await import('../lib/client.js')
   assert.equal(captured.def.id, 'dsh-plugin-messaging')
   const fakeReact = { createElement: () => null, useState: () => [undefined, () => {}], useEffect: () => {}, useCallback: (f) => f, useRef: () => ({ current: undefined }) }
@@ -223,7 +233,7 @@ await t('client: registers via __ModuleLoader__ and exports apply/inject', async
 
   // Each channel card is LED by the live "Keep the connection open" box, and that
   // box saves itself (immediate) because the bridge reacts without a restart.
-  for (const p of ['line', 'telegram', 'whatsapp']) {
+  for (const p of ['line', 'telegram', 'whatsapp', 'discord', 'messenger']) {
     const f = (PLATFORM_FIELDS[p] || [])[0]
     assert.ok(f && f.check === true && f.label === 'Keep the connection open', `${p} leads with the keep-open box`)
     assert.equal(f.immediate, true, `${p} saves on toggle`)
@@ -232,7 +242,125 @@ await t('client: registers via __ModuleLoader__ and exports apply/inject', async
   assert.deepEqual(PLATFORM_FIELDS.line[0].path, ['line', 'keepOpen'])
   assert.deepEqual(PLATFORM_FIELDS.telegram[0].path, ['telegram', 'keepOpen'])
   assert.deepEqual(PLATFORM_FIELDS.whatsapp[0].path, ['wa', 'keepOpen'], 'whatsapp writes the wa config key')
+  assert.deepEqual(PLATFORM_FIELDS.discord[0].path, ['discord', 'keepOpen'])
+  assert.deepEqual(PLATFORM_FIELDS.messenger[0].path, ['messenger', 'keepOpen'])
+  // Every field the settings page can touch must exist in the server Config, and the
+  // secret boxes must line up with the schema's role('secret') leaves exactly.
+  for (const [p, rows] of Object.entries(PLATFORM_FIELDS)) {
+    for (const f of rows) {
+      assert.ok(Array.isArray(f.path) && f.path.length === 2, `${p}.${f.label} has a two-part path`)
+      assert.equal(isSecretPath(f.path), !!f.secret, `${p}: secret flag matches the schema for ${f.path.join('.')}`)
+    }
+  }
   delete globalThis.window
+})
+
+// ---- page language ----
+// The 🌐 menu is `replyLanguage`, and the whole settings page is drawn from it:
+// picking a language must repaint every label, hint and button (nothing may stay
+// in the previous language), and it must do so without a restart.
+const THAI = /[฀-๿]/
+const HAN = /[一-鿿]/
+const collect = (node, acc = { texts: [], selects: [] }) => {
+  if (node == null || node === true || node === false) return acc
+  if (Array.isArray(node)) { for (const n of node) collect(n, acc); return acc }
+  if (typeof node === 'string') { acc.texts.push(node); return acc }
+  if (typeof node !== 'object') return acc
+  for (const k of Object.keys(node.props || {})) {
+    const v = node.props[k]
+    if (typeof v === 'string') acc.texts.push(v)
+  }
+  if (node.type === 'Select') acc.selects.push(node.props)
+  return collect(node.children, acc)
+}
+// Minimal stateful React: useConfig's two useState hooks are pre-seeded (ready +
+// draft) so Section renders the full page synchronously; useEffect is a no-op, so
+// the async load() never runs and the render is deterministic.
+const renderPage = (draft) => {
+  const states = [{ status: 'ready', writable: true, saved: false, configured: new Set(['telegram.botToken']) }, draft]
+  let i = 0
+  const react = {
+    createElement: (type, props, ...children) => ({ type: typeof type === 'function' ? (type.name || 'component') : type, props: props || {}, children }),
+    useState: (init) => { const k = i++; if (!(k in states)) states[k] = typeof init === 'function' ? init() : init; return [states[k], () => {}] },
+    useEffect: () => {},
+    useCallback: (f) => f,
+    useRef: (v) => ({ current: v }),
+  }
+  const api = CLIENT_DEF.factory((n) => { if (n === 'react') return react; throw new Error('unexpected require: ' + n) })
+  const settings = { describe: async () => ({ ok: true, value: { namespaces: [], writable: true } }), mutate: async () => ({ ok: true, value: {} }) }
+  const node = api.__internals.Section({ settings })
+  const acc = collect(node)
+  acc.api = api
+  acc.text = acc.texts.join('\n')
+  return acc
+}
+const PAGE = {
+  enabled: true, platform: 'line', translateBackend: 'google', maxCharsPerMessage: 1800,
+  counterEnabled: true, broadcast: { enabled: true, platforms: ['telegram'], shareSession: false },
+}
+await t('client: the whole page repaints in the selected language', () => {
+  assert.ok(CLIENT_DEF, 'client definition captured by the previous test')
+  const en = renderPage({ ...PAGE, replyLanguage: 'en' })
+  const th = renderPage({ ...PAGE, replyLanguage: 'th' })
+  const zh = renderPage({ ...PAGE, replyLanguage: 'zh' })
+
+  assert.ok(en.text.includes('General') && en.text.includes('Advanced') && en.text.includes('Save') && en.text.includes('Translation engine'), 'english labels')
+  assert.ok(th.text.includes('ทั่วไป') && th.text.includes('ขั้นสูง') && th.text.includes('บันทึก'), 'thai labels')
+  assert.ok(zh.text.includes('常规') && zh.text.includes('高级') && zh.text.includes('保存'), 'chinese labels')
+  // Nothing may leak from another language into the page you are looking at.
+  const leak = (label, txt, re, what) => assert.ok(!re.test(txt), `${label} page still contains ${what}: ${JSON.stringify((txt.match(re) || []).slice(0, 4))}`)
+  leak('english', en.text, THAI, 'Thai'); leak('english', en.text, HAN, 'Chinese')
+  leak('thai', th.text, HAN, 'Chinese')
+  leak('chinese', zh.text, THAI, 'Thai')
+
+  // The picker keeps native language names in every locale and shows what you chose.
+  const pick = (p) => p.selects.find((s) => (s.options || []).length === 3 && String((s.options[0] || {}).label || '').startsWith('🇬🇧'))
+  const lang = pick(en)
+  assert.ok(lang, 'language menu rendered as a select')
+  assert.ok(lang.options.some((o) => o.label.includes('🇹🇭') && o.label.includes('ไทย')), 'thai option names itself in thai')
+  assert.equal(pick(th).value, 'th', 'menu reflects the saved language (th)')
+  assert.equal(pick(zh).value, 'zh', 'menu reflects the saved language (zh)')
+  assert.equal(lang.value, 'en', 'menu reflects the saved language (en)')
+
+  // translateBackend=off means AI answers are NOT translated — say so, in the
+  // language the page is using, and only then.
+  const off = renderPage({ ...PAGE, replyLanguage: 'en', translateBackend: 'off' })
+  assert.ok(off.text.toLowerCase().includes('translation engine is set to'), 'warns when translation is off')
+  assert.ok(!en.text.toLowerCase().includes('translation engine is set to'), 'no warning while translating')
+  assert.ok(renderPage({ ...PAGE, replyLanguage: 'th', translateBackend: 'off' }).text.includes('ไม่ถูกแปล'), 'warning follows the page language')
+})
+
+await t('client: every UI string exists in all three languages', () => {
+  const { STR, platformFields, makeT } = renderPage({ ...PAGE, replyLanguage: 'en' }).api.__internals
+  // Rows that are technical product names stay Latin on purpose.
+  const LATIN_ONLY = new Set(['keepLabel', 'bcTitle', 'webhookPath', 'accessToken', 'phoneId', 'botToken',
+    'lineToken', 'lineTokenPh', 'modeWebhook', 'verifyToken', 'loadingLabel', 'appSecret',
+    'pageToken', 'graphVersion'])
+  for (const [id, row] of Object.entries(STR)) {
+    assert.ok(Array.isArray(row) && row.length === 3, `${id} has a th/en/zh column`)
+    row.forEach((s, k) => assert.ok(typeof s === 'string' && s.trim().length > 0, `${id}[${k}] is not empty`))
+    assert.ok(!THAI.test(row[1]), `${id} english column must be Thai-free`)
+    assert.ok(!THAI.test(row[2]) && !HAN.test(row[1]), `${id} en/zh columns must not mix scripts`)
+    if (!LATIN_ONLY.has(id)) assert.ok(THAI.test(row[0]), `${id} thai column should read as Thai`)
+  }
+  // {n} placeholders survive in every language.
+  for (const code of ['th', 'en', 'zh']) {
+    const s = makeT(code)('chanSettings', { n: 'LINE' })
+    assert.ok(s.includes('LINE') && !s.includes('{n}'), `${code} interpolates the platform name`)
+  }
+  // The channel field table follows the language too — and the Thai hint keeps the
+  // words "มีผลทันที" (applies immediately) the keep-open contract is tested on.
+  for (const [p, name] of [['line', 'LINE'], ['telegram', 'Telegram'], ['whatsapp', 'WhatsApp'],
+    ['discord', 'Discord'], ['messenger', 'Messenger']]) {
+    const enF = platformFields(makeT('en'))[p][0]
+    const thF = platformFields(makeT('th'))[p][0]
+    const zhF = platformFields(makeT('zh'))[p][0]
+    assert.equal(enF.label, 'Keep the connection open', `${p} checkbox keeps its product name`)
+    assert.ok(enF.hint.includes(name), `${p} english hint names the channel: ${enF.hint}`)
+    assert.ok(!THAI.test(enF.hint) && !HAN.test(enF.hint), `${p} english hint is clean`)
+    assert.ok(thF.hint.includes('มีผลทันที'), `${p} thai hint says live`)
+    assert.ok(HAN.test(zhF.hint) && !THAI.test(zhF.hint), `${p} chinese hint is Chinese`)
+  }
 })
 
 // ---- config ----
@@ -265,15 +393,26 @@ await t('config: editable leaves are volatile, secrets are role(secret)', () => 
   assert.equal(d.line.dict.allowedGroupIds.meta.volatile, true)
   assert.equal(d.telegram.dict.receiveMode.meta.volatile, true)
   assert.equal(d.wa.dict.phoneNumberId.meta.volatile, true)
+  assert.equal(d.discord.dict.botToken.meta.volatile, true)
+  assert.equal(d.messenger.dict.pageAccessToken.meta.volatile, true)
   // Secrets carry role('secret') so remote describe() redacts them.
   assert.equal(d.line.dict.channelAccessToken.meta.role, 'secret')
   assert.equal(d.line.dict.channelSecret.meta.role, 'secret')
   assert.equal(d.telegram.dict.botToken.meta.role, 'secret')
   assert.equal(d.wa.dict.accessToken.meta.role, 'secret')
   assert.equal(d.wa.dict.appSecret.meta.role, 'secret')
+  assert.equal(d.discord.dict.botToken.meta.role, 'secret')
+  assert.equal(d.messenger.dict.pageAccessToken.meta.role, 'secret')
+  assert.equal(d.messenger.dict.appSecret.meta.role, 'secret')
   // Non-secret leaves must NOT be marked secret (matches the client's field table).
   assert.notEqual(d.wa.dict.verifyToken.meta.role, 'secret')
   assert.notEqual(d.line.dict.channelAccessTokenEnv.meta.role, 'secret')
+  assert.notEqual(d.discord.dict.gatewayUrl.meta.role, 'secret')
+  assert.notEqual(d.messenger.dict.verifyToken.meta.role, 'secret')
+  // `platform` accepts all five transports and nothing else.
+  for (const p of ['line', 'telegram', 'whatsapp', 'discord', 'messenger']) {
+    assert.equal(Config({ platform: p }).platform.get(), p, `${p} is a valid platform`)
+  }
 })
 await t('config: resolveConfig unwraps live Volatile refs (cordis apply input)', () => {
   // Simulate the live config cordis hands apply(): volatile leaves are Volatile refs.
@@ -294,13 +433,20 @@ await t('config: keepOpen defaults off; wantedPlatforms = primary + kept-open ch
   assert.equal(c.line.keepOpen, false)
   assert.equal(c.telegram.keepOpen, false)
   assert.equal(c.wa.keepOpen, false)
+  assert.equal(c.discord.keepOpen, false)
+  assert.equal(c.messenger.keepOpen, false)
+  assert.equal(c.discord.botTokenEnv, 'DISCORD_BOT_TOKEN')
+  assert.equal(c.messenger.graphVersion, 'v24.0', 'Meta rolls Graph versions on a schedule; the default must be current')
+  assert.equal(c.messenger.webhookPath, '/plugins/messaging/messenger/webhook')
   assert.deepEqual(wantedPlatforms(c), ['line'])
   assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'telegram', line: { keepOpen: true }, wa: { keepOpen: true } })),
     ['telegram', 'line', 'whatsapp'], 'primary first, then each kept-open channel')
   assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'whatsapp', wa: { keepOpen: true } })),
     ['whatsapp'], 'primary already kept open is not duplicated')
   assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'line', broadcast: { enabled: true } })),
-    ['line', 'telegram', 'whatsapp'], 'broadcast still runs everything')
+    ['line', 'telegram', 'whatsapp', 'discord', 'messenger'], 'broadcast still runs everything')
+  assert.deepEqual(wantedPlatforms(resolveConfig({ platform: 'discord', messenger: { keepOpen: true } })),
+    ['discord', 'messenger'], 'the two newest channels follow the same keep-open rule')
 })
 await t('config: resolved view reads THROUGH the live refs, so a save lands without a restart', () => {
   // Stand-in for the Volatile refs cordis owns: .get() always returns the current
@@ -325,7 +471,7 @@ await t('config: resolved view reads THROUGH the live refs, so a save lands with
   live.wa = { keepOpen: ref(true) }
   assert.deepEqual(wantedPlatforms(cfg), ['telegram', 'whatsapp'], 'a sub-object the host starts sending is picked up too')
   live.broadcast.enabled.set(true)
-  assert.deepEqual(wantedPlatforms(cfg), ['line', 'telegram', 'whatsapp'], 'broadcast flip is live too')
+  assert.deepEqual(wantedPlatforms(cfg), ['line', 'telegram', 'whatsapp', 'discord', 'messenger'], 'broadcast flip is live too')
   // A plain object (tests, hand-written config) stays a plain snapshot.
   const plain = resolveConfig({ replyLanguage: 'zh' })
   assert.equal(plain.replyLanguage, 'zh')
@@ -800,6 +946,315 @@ await t('index: keepOpen opens that channel on save and closes it again — no r
   } finally {
     console.log = realLog
     console.warn = realWarn
+  }
+})
+
+// ---- discord ----
+// Driving the gateway client with hand-written opcodes covers identify / heartbeat /
+// dispatch / resume / intent-downgrade without ever touching discord.com.
+class FakeSocket {
+  static instances = []
+  constructor(url) {
+    this.url = url; this.sent = []; this.readyState = 1
+    this.onmessage = null; this.onclose = null; this.onerror = null
+    FakeSocket.instances.push(this)
+  }
+  send(data) { this.sent.push(JSON.parse(data)) }
+  close(code) { this.readyState = 3; this.onclose?.({ code: code ?? 1006, reason: 'closed by test' }) }
+  emit(payload) { this.onmessage?.({ data: JSON.stringify(payload) }) }
+  last(op) { return this.sent.filter((p) => p.op === op).pop() }
+}
+
+await t('discord gateway: HELLO → identify → READY → MESSAGE_CREATE, resume, 4014, fatal', async () => {
+  const { DiscordGateway, INTENTS } = await import('../lib/adapters/discord.js')
+  const intents = INTENTS.GUILD_MESSAGES | INTENTS.DIRECT_MESSAGES | INTENTS.MESSAGE_CONTENT
+  const ready = []; const msgs = []
+  const gw = new DiscordGateway({
+    token: 'T', intents,
+    hooks: { onReady: (r) => ready.push(r), onMessage: (m) => msgs.push(m), log: () => {} },
+    webSocket: FakeSocket,
+  })
+  FakeSocket.instances.length = 0
+  gw.start()
+  const ws = FakeSocket.instances[0]
+  ws.emit({ op: 10, d: { heartbeat_interval: 45000, url: 'wss://gateway.example' } })
+  const id = ws.last(2)
+  assert.ok(id, 'identify (op 2) follows HELLO')
+  assert.equal(id.d.token, 'T')
+  assert.equal(id.d.intents, intents)
+  assert.ok(String(id.d.properties.browser).includes('dsh-plugin-messaging'), 'identifies as this plugin')
+  ws.emit({ op: 0, t: 'READY', s: 7, d: { user: { id: '424242424242424242' }, session_id: 'S1', resume_gateway_url: 'wss://resume.example' } })
+  assert.equal(ready[0].botUserId, '424242424242424242', 'bot id comes from READY (the mention gate needs it)')
+  assert.equal(gw.resumeUrl, 'wss://resume.example/?v=10&encoding=json', 'READY moves the reconnect target')
+  ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 8, d: { id: 'm1', channel_id: 'c1', content: 'hi' } })
+  ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 9, d: { id: 'bad' } })
+  ws.emit({ op: 0, t: 'GUILD_CREATE', s: 10, d: { id: 'g1' } })
+  assert.deepEqual(msgs.map((m) => m.id), ['m1'], 'only a well-formed MESSAGE_CREATE is forwarded')
+  assert.equal(gw.lastSeq, 10, 'every dispatch advances the resume seq')
+  gw.startHeartbeat(ws, 10)
+  await new Promise((r) => setTimeout(r, 45))
+  assert.ok(ws.last(1), 'heartbeat (op 1) carries the seq')
+  assert.equal(ws.last(1).d, 10)
+  gw.stop()
+  assert.equal(gw.reconnectTimer, undefined, 'stop clears every timer')
+
+  // Reconnecting with a session id resumes (op 6) instead of re-identifying.
+  const gw2 = new DiscordGateway({ token: 'T', intents, hooks: { log: () => {} }, webSocket: FakeSocket })
+  gw2.sessionId = 'S9'; gw2.lastSeq = 42
+  gw2.start()
+  const ws2 = FakeSocket.instances.at(-1)
+  ws2.emit({ op: 10, d: { heartbeat_interval: 45000 } })
+  assert.deepEqual(ws2.last(6).d, { token: 'T', session_id: 'S9', seq: 42 }, 'op 6 Resume carries session id + last seq')
+  assert.equal(ws2.last(2), undefined, 'a resume replaces identify')
+  gw2.stop()
+
+  // Close 4014 = disallowed intents: drop MESSAGE_CONTENT once and retry.
+  const gw3 = new DiscordGateway({ token: 'T', intents, hooks: { log: () => {} }, webSocket: FakeSocket })
+  FakeSocket.instances.length = 0
+  gw3.start()
+  FakeSocket.instances[0].onclose({ code: 4014, reason: 'disallowed intents' })
+  assert.equal(gw3.intents & INTENTS.MESSAGE_CONTENT, 0, 'the privileged intent is dropped, not requested forever')
+  assert.ok(gw3.reconnectTimer !== undefined, 'and a reconnect is scheduled instead of dying')
+  gw3.stop()
+
+  // An invalid token is terminal — no endless reconnect storm.
+  const fatal = []
+  const gw4 = new DiscordGateway({ token: 'T', intents, hooks: { onFatal: (r) => fatal.push(r), log: () => {} }, webSocket: FakeSocket })
+  FakeSocket.instances.length = 0
+  gw4.start()
+  FakeSocket.instances[0].onclose({ code: 4004, reason: 'invalid token' })
+  assert.equal(fatal.length, 1, 'onFatal fires once')
+  assert.ok(/4004/.test(fatal[0]), 'the close code is reported')
+  assert.equal(gw4.stopped, true, 'an invalid token does not reconnect forever')
+})
+
+await t('discord rest: bot user-agent, allowed_mentions, 429 retry, DM channel, mention strip', async () => {
+  const { discordRest, stripBotMentions } = await import('../lib/adapters/discord.js')
+  const calls = []
+  let rateLimited = 0
+  const fetchImpl = async (url, init) => {
+    const u = String(url)
+    calls.push({ url: u, init })
+    if (u.includes('/messages') && rateLimited++ === 0) {
+      return { status: 429, ok: false, json: async () => ({ retry_after: 0.01 }), text: async () => '{}' }
+    }
+    if (u.endsWith('/users/@me')) return { ok: true, status: 200, text: async () => '{"id":"424242424242424242","username":"bridge"}' }
+    if (u.endsWith('/users/@me/channels')) return { ok: true, status: 200, text: async () => '{"id":"DMCHAN"}' }
+    return { ok: true, status: 200, text: async () => '{"id":"msg1"}' }
+  }
+  const rest = discordRest({ token: 'T', fetchImpl })
+  assert.equal((await rest.getMe()).id, '424242424242424242')
+  assert.equal(calls[0].init.headers.authorization, 'Bot T', 'bot token goes in the authorization header')
+  assert.ok(/DiscordBot \(/.test(calls[0].init.headers['user-agent']), 'Cloudflare answers 403 without a bot User-Agent')
+  await rest.createMessage('c1', 'hello', 'q1')
+  const body = JSON.parse(calls.at(-1).init.body)
+  assert.deepEqual(body.allowed_mentions, { parse: [] }, 'the bridge never pings anybody')
+  assert.deepEqual(body.message_reference, { message_id: 'q1', fail_if_not_exists: false }, 'a reply threads under the question')
+  assert.equal(calls.filter((c) => c.url.includes('/messages')).length, 2, 'a 429 is retried after retry_after')
+  assert.equal((await rest.createDM('u9')).id, 'DMCHAN')
+  assert.equal(stripBotMentions('<@!424242424242424242> /new', '424242424242424242'), '/new', 'the mention is stripped so commands still parse')
+  assert.equal(stripBotMentions('hello <@424242424242424242> there', '424242424242424242'), 'hello there', 'a mention anywhere is removed, whitespace stays sane')
+  assert.equal(stripBotMentions('<@424242424242424242>', '424242424242424242'), '')
+  assert.equal(stripBotMentions('   ', '424242424242424242'), '')
+  assert.equal(stripBotMentions('keep <@1234567890> others', '424242424242424242'), 'keep <@1234567890> others', 'other people are left alone')
+})
+
+await t('discord adapter: sign-in, mention gate, self/bot/allowlist filters, dedupe, threaded replies, live status', async () => {
+  const { createDiscordAdapter } = await import('../lib/adapters/discord.js')
+  const cfg = resolveConfig({ discord: { botToken: 'T', allowedUserIds: ['u1'] } })
+  const seen = []; const posts = []; const patches = []
+  const realFetch = globalThis.fetch
+  const realWS = globalThis.WebSocket
+  globalThis.fetch = async (url, init) => {
+    const u = String(url)
+    if (init?.method === 'PATCH') { patches.push(JSON.parse(init.body)); return { ok: true, status: 200, text: async () => '{}' } }
+    if (u.endsWith('/users/@me')) return { ok: true, status: 200, text: async () => '{"id":"424242424242424242","username":"bridge"}' }
+    const body = JSON.parse(init.body)
+    posts.push({ url: u, body })
+    return { ok: true, status: 200, text: async () => '{"id":"DMCHAN"}' }
+  }
+  globalThis.WebSocket = FakeSocket
+  let adapter
+  try {
+    adapter = createDiscordAdapter(cfg, { bridge: { onInbound: (e) => seen.push(e) }, log: () => {} })
+    assert.equal(adapter.configured, true)
+    FakeSocket.instances.length = 0
+    await adapter.start()
+    const ws = FakeSocket.instances.at(-1)
+    ws.emit({ op: 10, d: { heartbeat_interval: 45000 } })
+    ws.emit({ op: 0, t: 'READY', s: 1, d: { user: { id: '424242424242424242' }, session_id: 'S', resume_gateway_url: 'wss://r' } })
+    const gm = (o) => ({
+      id: o.id, channel_id: 'gc1', guild_id: 'g1', content: o.content ?? 'hello',
+      author: o.author ?? { id: 'u1' }, mentions: o.mentions ?? [],
+    })
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 2, d: gm({ id: 'a' }) })
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 3, d: gm({ id: 'b', author: { id: '424242424242424242' }, mentions: [{ id: '424242424242424242' }] }) })
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 4, d: gm({ id: 'c', author: { id: 'hacker' }, mentions: [{ id: '424242424242424242' }] }) })
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 5, d: gm({ id: 'd', author: { id: 'u1', bot: true }, mentions: [{ id: '424242424242424242' }] }) })
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 6, d: gm({ id: 'f', content: '   ', mentions: [{ id: '424242424242424242' }] }) })
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(seen.length, 0, 'mention gate, self-messages, allowlist, bots and empty text are all rejected')
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 7, d: gm({ id: 'e', content: '<@!424242424242424242> /status', mentions: [{ id: '424242424242424242' }] }) })
+    ws.emit({ op: 0, t: 'MESSAGE_CREATE', s: 7, d: gm({ id: 'e', content: '<@!424242424242424242> /status', mentions: [{ id: '424242424242424242' }] }) })
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(seen.length, 1, 'exactly one inbound; a replayed event is dropped')
+    assert.equal(seen[0].platform, 'discord')
+    assert.equal(seen[0].chatId, 'gc1')
+    assert.equal(seen[0].userId, 'u1')
+    assert.equal(seen[0].isGroup, true, 'a guild channel is a group (session title prefix applies)')
+    assert.equal(seen[0].text, '/status', 'the bot mention is stripped so commands still parse')
+    await seen[0].send(['one', 'two'])
+    assert.deepEqual(posts.map((p) => p.body.content), ['one', 'two'])
+    assert.equal(posts[0].body.message_reference?.message_id, 'e', 'the first chunk threads under the question')
+    assert.equal(posts[1].body.message_reference, undefined, 'the rest are plain sends')
+    // A live status is possible because Discord messages are editable.
+    const st = await seen[0].startStatus('thinking…')
+    await st.update('still thinking')
+    assert.equal(patches.length, 0, 'edits are throttled (Discord allows ~5 per 5 s per message)')
+    await st.replace('done')
+    assert.equal(patches.length, 1, 'the final answer replaces the status in place')
+    assert.deepEqual(patches[0], { content: 'done', allowed_mentions: { parse: [] } })
+    // Broadcast push: `user:<id>` opens (and caches) a DM channel.
+    await adapter.send('user:u2', ['ping'])
+    assert.ok(posts.some((p) => p.url.endsWith('/users/@me/channels')), 'a DM channel is opened for user:<id>')
+    await adapter.send('user:u2', ['pong'])
+    const dmPosts = posts.filter((p) => p.url.includes('/channels/DMCHAN/messages'))
+    assert.deepEqual(dmPosts.map((p) => p.body.content), ['ping', 'pong'], 'the DM channel is cached, not re-created')
+    assert.equal(posts.filter((p) => p.url.endsWith('/users/@me/channels')).length, 1, 'the DM is opened once')
+    await adapter.send('42', ['to a channel'])
+    assert.ok(posts.at(-1).url.endsWith('/channels/42/messages'), 'a bare id is a channel id')
+  } finally {
+    if (adapter) await adapter.stop()
+    globalThis.fetch = realFetch
+    globalThis.WebSocket = realWS
+  }
+})
+
+// ---- messenger ----
+await t('messenger: X-Hub-Signature-256, webhook body parsing, 24h window error', async () => {
+  const { verifyMessengerSignature, parseMessengerBody, isMessengerWindowError, DEFAULT_GRAPH_VERSION } = await import('../lib/adapters/messenger.js')
+  assert.equal(DEFAULT_GRAPH_VERSION, 'v24.0', 'Meta rolls Graph versions on a schedule; keep the default current')
+  const secret = 'app-secret'
+  const body = JSON.stringify({
+    object: 'page',
+    entry: [{ id: 'PAGE1', messaging: [
+      { sender: { id: 'P1' }, timestamp: 1, message: { mid: 'm1', text: 'hello' } },
+      { sender: { id: 'P2' }, message: { mid: 'm2', text: 'echo of our own reply', is_echo: true } },
+      { sender: { id: 'P3' }, message: { mid: 'm3', text: '   ' } },
+      { sender: { id: 'P4' }, message: { mid: 'm4', attachments: [{ type: 'image' }] } },
+      { sender: { id: 'P5' }, read: { watermark: 1 } },
+      { sender: { id: 'P6' }, message: { mid: 'm6', text: 'blocked sender' } },
+    ] }],
+  })
+  const good = 'sha256=' + createHmac('sha256', secret).update(body, 'utf8').digest('hex')
+  assert.ok(verifyMessengerSignature(secret, body, good), 'a valid signature passes')
+  assert.ok(!verifyMessengerSignature(secret, body, 'sha256=' + '0'.repeat(64)), 'a forged signature fails')
+  assert.ok(!verifyMessengerSignature(secret, body, undefined), 'a missing signature fails')
+  assert.ok(!verifyMessengerSignature(secret, body, 'short'), 'a short header cannot panic the compare')
+  assert.ok(verifyMessengerSignature('', body, undefined), 'no app secret configured = dev mode')
+  const items = parseMessengerBody(JSON.parse(body), { isAllowed: (id) => id !== 'P6' })
+  assert.deepEqual(items.map((i) => i.psid), ['P1'], 'echoes, blank text, attachments, read receipts and blocked senders are skipped')
+  assert.equal(items[0].text, 'hello')
+  assert.equal(items[0].isGroup, false, 'the Send API cannot address Messenger group threads — never claim one')
+  assert.deepEqual(parseMessengerBody({}, {}), [], 'a body without entry[] cannot crash the parse')
+  assert.ok(isMessengerWindowError(400, '{"error":{"message":"(#10) This message was not delivered because the 24 hour window has passed","code":10,"error_subcode":551}}'), 'the window error is recognised')
+  assert.ok(isMessengerWindowError(400, '(#10) The recipient is not available to your app'), 'the "not available" wording too')
+  assert.ok(!isMessengerWindowError(200, '{"message_id":"m"}'), 'a send that worked is not a window error')
+  assert.ok(!isMessengerWindowError(400, '{"error":{"message":"Invalid OAuth access token","code":190}}'), 'a token error is not a window error')
+})
+
+await t('messenger adapter: GET handshake, signed POST, allowlist, typing bubble, MESSAGE_TAG retry', async () => {
+  const { createMessengerAdapter } = await import('../lib/adapters/messenger.js')
+  const cfg = resolveConfig({
+    messenger: {
+      pageAccessToken: 'PAT', appSecret: 'SEC', verifyToken: 'VT', pageId: 'PAGE1',
+      outOfWindowTag: 'HUMAN_AGENT', allowedUserIds: ['P1'],
+    },
+  })
+  const posts = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : undefined
+    posts.push({ url: String(url), body })
+    // Every free-form reply is treated as outside the window, so the tag fallback runs.
+    if (body?.messaging_type === 'RESPONSE') {
+      return { ok: false, status: 400, text: async () => '{"error":{"message":"(#10) This message was not delivered because the 24 hour window has passed","code":10,"error_subcode":551}}' }
+    }
+    return { ok: true, status: 200, text: async () => '{"message_id":"mid"}' }
+  }
+  const routes = []
+  let handler = null
+  const seen = []
+  const logs = []
+  const ctx = {
+    get: (n) => (n === 'webServer'
+      ? { register: (r) => { routes.push(r.path); handler = r.handler; return () => routes.splice(routes.indexOf(r.path), 1) } }
+      : undefined),
+  }
+  const mkRes = () => ({ statusCode: 0, chunks: [], end(s) { if (s != null) this.chunks.push(String(s)) } })
+  const post = (raw, headers) => new Promise((resolve) => {
+    const req = Readable.from([raw])
+    req.method = 'POST'; req.url = '/plugins/messaging/messenger/webhook'; req.headers = headers || {}
+    const res = mkRes()
+    handler(req, res)
+    // The handler answers, then parses on the next ticks; give it both.
+    setTimeout(() => resolve(res), 30)
+  })
+  let adapter
+  try {
+    adapter = createMessengerAdapter(cfg, { bridge: { onInbound: (e) => seen.push(e) }, log: (m) => logs.push(String(m)), ctx })
+    assert.equal(adapter.configured, true)
+    await adapter.start()
+    assert.ok(handler, 'the webhook route was registered at the configured path')
+    assert.equal(routes[0], '/plugins/messaging/messenger/webhook')
+
+    // Subscription handshake.
+    const okGet = mkRes()
+    handler({ method: 'GET', url: '/x?hub.mode=subscribe&hub.verify_token=VT&hub.challenge=1234' }, okGet)
+    assert.equal(okGet.statusCode, 200, 'the handshake answers 200')
+    assert.equal(okGet.chunks.join(''), '1234', 'and echoes hub.challenge back')
+    const badGet = mkRes()
+    handler({ method: 'GET', url: '/x?hub.mode=subscribe&hub.verify_token=nope&hub.challenge=1' }, badGet)
+    assert.equal(badGet.statusCode, 403, 'a wrong verify token is refused')
+
+    // Signature enforcement before anything is parsed.
+    const body = JSON.stringify({ object: 'page', entry: [{ id: 'PAGE1', messaging: [
+      { sender: { id: 'P1' }, message: { mid: 'm1', text: 'hi there' } },
+      { sender: { id: 'P9' }, message: { mid: 'm9', text: 'not on the list' } },
+    ] }] })
+    const forged = await post(body, { 'x-hub-signature-256': 'sha256=' + 'f'.repeat(64) })
+    assert.equal(forged.statusCode, 401, 'a bad X-Hub-Signature-256 is rejected')
+    assert.equal(seen.length, 0, 'and nothing reaches the bridge')
+    const good = await post(body, { 'x-hub-signature-256': 'sha256=' + createHmac('sha256', 'SEC').update(body, 'utf8').digest('hex') })
+    assert.equal(good.statusCode, 200, 'the webhook is acked before the AI turn even starts (Meta retries after 20 s)')
+    assert.ok(seen.length === 1, 'only the allowlisted PSID reaches the bridge')
+    assert.equal(seen[0].platform, 'messenger')
+    assert.equal(seen[0].chatId, 'P1', 'the PSID is the chat id')
+    assert.equal(seen[0].text, 'hi there')
+    // The same mid twice = a Meta retry, answered once.
+    await post(body, { 'x-hub-signature-256': 'sha256=' + createHmac('sha256', 'SEC').update(body, 'utf8').digest('hex') })
+    assert.equal(seen.length, 1, 'a retried webhook delivery is deduped by mid')
+
+    // Typing bubble + the window-aware send.
+    seen[0].typing()
+    await new Promise((r) => setTimeout(r, 10))
+    assert.ok(posts.some((p) => p.body?.sender_action === 'typing_on'), 'typing_on is a sender_action, not a message')
+    await seen[0].send(['the answer'])
+    const sends = posts.filter((p) => p.body?.message)
+    assert.deepEqual(sends.map((p) => p.body.messaging_type), ['RESPONSE', 'MESSAGE_TAG'], 'a closed window retries once as a tagged message')
+    assert.equal(sends[0].body.recipient.id, 'P1')
+    assert.equal(sends[0].body.messaging_type, 'RESPONSE', 'inside the window Meta wants RESPONSE')
+    assert.equal(sends[1].body.tag, 'HUMAN_AGENT', 'the configured tag carries the retry')
+    assert.equal(sends[1].body.message.text, 'the answer', 'the text is unchanged')
+    assert.equal(sends[1].body.message.metadata, 'dsh-messaging-bridge', 'tagged sends are marked as machine traffic')
+    assert.ok(posts[0].url.includes('/v24.0/PAGE1/messages'), 'the Graph version and Page id are in the URL')
+    assert.ok(posts[0].url.includes('access_token=PAT'), 'the Page token authenticates the call')
+    assert.ok(logs.some((l) => /24h window/.test(l)), 'the window problem is explained in the log')
+    await adapter.stop()
+    assert.deepEqual(routes, [], 'stopping disposes the webhook route')
+  } finally {
+    if (adapter) await adapter.stop()
+    globalThis.fetch = realFetch
   }
 })
 
