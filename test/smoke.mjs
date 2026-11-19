@@ -184,11 +184,20 @@ await t('modules: full graph imports (index + bridge + adapters)', async () => {
   assert.equal(typeof idx.Config, 'function')
   const { createBridge } = await import('../lib/bridge.js')
   assert.equal(typeof createBridge, 'function')
-  const ADAPTER_EXPORTS = { telegram: 'createTelegramAdapter', line: 'createLineAdapter', whatsapp: 'createWhatsAppAdapter' }
+  const ADAPTER_EXPORTS = {
+    telegram: 'createTelegramAdapter', line: 'createLineAdapter', whatsapp: 'createWhatsAppAdapter',
+    discord: 'createDiscordAdapter', messenger: 'createMessengerAdapter',
+  }
   for (const [p, fn] of Object.entries(ADAPTER_EXPORTS)) {
     const m = await import(`../lib/adapters/${p}.js`)
     assert.equal(typeof m[fn], 'function', `${p} adapter export`)
   }
+  // deliver.js is the piece every channel's delivery runs through, and it is only
+  // unit-testable because it drags nothing in: no cordis, no adapters, no config.
+  const deliverSrc = readFileSync(new URL('../lib/deliver.js', import.meta.url), 'utf8')
+  assert.ok(!/^\s*import\s/m.test(deliverSrc), 'deliver.js has no imports at all — keep it that way')
+  const { deliverChunks } = await import('../lib/deliver.js')
+  assert.equal(typeof deliverChunks, 'function')
 })
 
 // ---- client bundle ----
@@ -913,7 +922,7 @@ await t('index: keepOpen opens that channel on save and closes it again — no r
     translateBackend: ref('off'),
     stateFile: ref(join(tmp, 'idx-state.json')),
     counterFile: ref(join(tmp, 'idx-counter.json')),
-    line: { channelAccessToken: ref('LTOK'), channelSecret: ref(''), webhookPath: ref('/plugins/messaging/line/webhook') },
+    line: { channelAccessToken: ref('LTOK'), channelSecret: ref('LSECRET'), webhookPath: ref('/plugins/messaging/line/webhook') },
     // botTokenEnv points at a variable that cannot exist, so an empty token really
     // means "idle" no matter what the machine running the tests has exported.
     telegram: { botToken: ref(''), botTokenEnv: ref('DSH_TEST_NO_TELEGRAM_TOKEN'), keepOpen: ref(false) },
@@ -1191,7 +1200,7 @@ await t('messenger: X-Hub-Signature-256, webhook body parsing, 24h window error'
   assert.ok(!verifyMessengerSignature(secret, body, 'sha256=' + '0'.repeat(64)), 'a forged signature fails')
   assert.ok(!verifyMessengerSignature(secret, body, undefined), 'a missing signature fails')
   assert.ok(!verifyMessengerSignature(secret, body, 'short'), 'a short header cannot panic the compare')
-  assert.ok(verifyMessengerSignature('', body, undefined), 'no app secret configured = dev mode')
+  assert.ok(!verifyMessengerSignature('', body, good), 'no app secret configured = nothing is verifiable, so nothing is accepted (the route is never opened either)')
   const items = parseMessengerBody(JSON.parse(body), { isAllowed: (id) => id !== 'P6' })
   assert.deepEqual(items.map((i) => i.psid), ['P1'], 'echoes, blank text, attachments, read receipts and blocked senders are skipped')
   assert.equal(items[0].text, 'hello')
@@ -1295,6 +1304,185 @@ await t('messenger adapter: GET handshake, signed POST, allowlist, typing bubble
   } finally {
     if (adapter) await adapter.stop()
     globalThis.fetch = realFetch
+  }
+})
+
+// ---- delivery (lib/deliver.js) ----
+// The bug this guards cost an entire answer: a refused status edit threw on the line
+// before ev.send(), so the turn aborted with the reply in hand.
+await t('deliver: a live status that refuses to become the answer never swallows the reply', async () => {
+  const { deliverChunks } = await import('../lib/deliver.js')
+  const logs = []
+  const sent = []
+  const send = async (chunks) => { sent.push(chunks); return { kind: 'push', sent: chunks.length } }
+
+  // 1 · the edit works: the status IS chunk #1, so only the tail needs a new message.
+  const edited = []
+  let r = await deliverChunks({
+    status: { replace: async (x) => { edited.push(x) } },
+    chunks: ['one', 'two', 'three'], send, log: (m) => logs.push(String(m)),
+  })
+  assert.deepEqual(edited, ['one'], 'the status is edited into the first chunk')
+  assert.deepEqual(sent.at(-1), ['two', 'three'], 'only the rest is sent as new messages')
+  assert.equal(r.replaced, true)
+  assert.equal(r.sent, 3, 'the whole answer counts exactly once')
+  // Mixed delivery (head edited in, tail pushed) is reported with the adapter's own
+  // kind for the tail: 'push' is the metered one, and billing the lot as a free reply
+  // would be the same kind of lie the counter was built to avoid.
+  assert.equal(r.kind, 'push', 'what was pushed decides how it is billed')
+
+  // 2 · the edit is refused: everything goes out as a fresh message.
+  sent.length = 0
+  r = await deliverChunks({
+    status: { replace: async () => { throw new Error('editMessageText failed') } },
+    chunks: ['one', 'two'], send, log: (m) => logs.push(String(m)),
+  })
+  assert.deepEqual(sent[0], ['one', 'two'], 'a refused edit sends the WHOLE reply — the user still gets the answer')
+  assert.equal(r.sent, 2, 'and nothing is counted twice')
+  assert.equal(r.replaced, false, 'it is a push now, because it really is one (the counter bills accordingly)')
+  assert.ok(logs.some((l) => /live status could not become the answer/.test(l)), 'the log says what happened')
+
+  // 3 · single-chunk answer on an editable channel: one API call, no extra message.
+  sent.length = 0
+  r = await deliverChunks({ status: { replace: async () => {} }, chunks: ['only'], send })
+  assert.deepEqual(r, { kind: 'reply', sent: 1, replaced: true })
+  assert.equal(sent.length, 0, 'nothing was sent at all')
+
+  // 4 · a platform without editable messages (Messenger, LINE) just sends.
+  r = await deliverChunks({ chunks: ['a', 'b'], send })
+  assert.deepEqual(r, { kind: 'push', sent: 2, replaced: false })
+
+  // 5 · the send itself dies halfway: the error carries what did land.
+  const e = await deliverChunks({
+    chunks: ['a', 'b', 'c'],
+    send: async () => { const err = new Error('graph 503'); err.sent = 1; throw err },
+  }).then(() => null, (x) => x)
+  assert.ok(e instanceof Error, 'the failure still reaches the caller (the user must be told)')
+  assert.equal(e.sent, 1, 'with the honest count of what reached the chat, so a retry cannot double-send')
+
+  // 6 · a head chunk that landed before the tail failed is included in that count.
+  const e2 = await deliverChunks({
+    status: { replace: async () => {} }, chunks: ['a', 'b'],
+    send: async () => { throw new Error('boom') },
+  }).then(() => null, (x) => x)
+  assert.equal(e2.sent, 1, 'the chunk the status already delivered is not lost from the count')
+
+  // 7 · empty answer: nothing to deliver, nothing to count.
+  assert.deepEqual(await deliverChunks({ chunks: [], send }), { kind: 'push', sent: 0, replaced: false })
+})
+
+// ---- webhook authentication ----
+// Every one of these webhooks used to treat "no secret configured" as "trust the
+// body". The body is where the sender identity — the bridge's entire allowlist —
+// comes from, so that combination is a login-as-anyone endpoint.
+await t('webhooks: an adapter that cannot verify a caller does not open the route at all', async () => {
+  const { createLineAdapter } = await import('../lib/adapters/line.js')
+  const { createWhatsAppAdapter } = await import('../lib/adapters/whatsapp.js')
+  const { createMessengerAdapter } = await import('../lib/adapters/messenger.js')
+  const routes = []
+  const logs = []
+  const ctx = {
+    get: (n) => (n === 'webServer'
+      ? { register: (rt) => { routes.push(rt.path); return () => { const i = routes.indexOf(rt.path); if (i >= 0) routes.splice(i, 1) } } }
+      : undefined),
+  }
+  const log = (m) => logs.push(String(m))
+  // Every *Env points at a variable that cannot exist, so "no secret" here means the
+  // same thing on any machine, whatever the CI box happens to have exported.
+  const line = createLineAdapter(resolveConfig({
+    line: { channelAccessToken: 'LTOK', channelSecretEnv: 'DSH_TEST_NO_LINE_SECRET', webhookPath: '/lh' },
+  }), { bridge: {}, log, ctx })
+  const wa = createWhatsAppAdapter(resolveConfig({
+    wa: { accessToken: 'WTOK', accessTokenEnv: 'DSH_TEST_NO_WA_TOKEN', phoneNumberId: 'PID', appSecretEnv: 'DSH_TEST_NO_WA_SECRET', webhookPath: '/wh' },
+  }), { bridge: {}, log, ctx })
+  const msg = createMessengerAdapter(resolveConfig({
+    messenger: { pageAccessToken: 'MPAT', pageAccessTokenEnv: 'DSH_TEST_NO_MESSENGER_TOKEN', appSecretEnv: 'DSH_TEST_NO_MESSENGER_SECRET', verifyToken: 'VT', pageId: 'PAGE1', webhookPath: '/mh' },
+  }), { bridge: {}, log, ctx })
+
+  await line.start(); await wa.start(); await msg.start()
+  assert.deepEqual(routes, [], 'no secret, no route — not even one that answers 401 (Meta would mark it verified and stop retrying)')
+  assert.equal(logs.filter((l) => /webhook stays closed/.test(l)).length, 3, 'each adapter says out loud why it is shut')
+  assert.ok(logs.every((l) => /appSecret|channelSecret|App Secret|channel secret/.test(l) || !/webhook stays closed/.test(l)), 'and points at the field to fill in')
+
+  // The gate must not be a wall: hand it the secret and it behaves exactly as before.
+  const line2 = createLineAdapter(resolveConfig({
+    line: { channelAccessToken: 'LTOK', channelSecret: 'LSEC', channelSecretEnv: 'DSH_TEST_NO_LINE_SECRET', webhookPath: '/lh' },
+  }), { bridge: {}, log, ctx })
+  await line2.start()
+  assert.deepEqual(routes, ['/lh'], 'with a channel secret the webhook opens as it always did')
+  await line2.stop()
+})
+
+await t('messenger: a Graph 503 fails the send instead of reporting success', async () => {
+  const { createMessengerAdapter } = await import('../lib/adapters/messenger.js')
+  const cfg = resolveConfig({
+    messenger: {
+      pageAccessToken: 'PAT', pageAccessTokenEnv: 'DSH_TEST_NO_MESSENGER_TOKEN_503', appSecret: 'SEC',
+      appSecretEnv: 'DSH_TEST_NO_MESSENGER_SECRET_503', pageId: 'PAGE1', allowedUserIds: ['P1'],
+    },
+  })
+  const posts = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : undefined
+    posts.push(body?.message?.text)
+    if (body?.message?.text === 'two') {
+      return { ok: false, status: 503, text: async () => '{"error":{"message":"Service temporarily unavailable","type":"ServiceUnavailableException","code":1,"is_transient":true}}' }
+    }
+    return { ok: true, status: 200, text: async () => '{"message_id":"mid"}' }
+  }
+  const logs = []
+  // Both outbound paths (the reply ev.send and the broadcast adapter.send) run through
+  // the same sendChunks, so the broadcast entry point tests the accounting itself.
+  const adapter = createMessengerAdapter(cfg, { bridge: {}, log: (m) => logs.push(String(m)), ctx: { get: () => undefined } })
+  try {
+    const e = await adapter.send('P1', ['one', 'two', 'three']).then(() => null, (x) => x)
+    assert.ok(e instanceof Error, 'a 503 is not a delivered message, so the send must not resolve')
+    assert.equal(e.sent, 1, 'only the chunk Meta accepted is counted — a retry will not resend it')
+    assert.ok(/503/.test(e.message), 'the Graph status is in the error the operator sees')
+    assert.ok(/Service temporarily unavailable/.test(e.message), 'and Meta\u2019s own wording, not just a status code')
+    assert.deepEqual(posts, ['one', 'two'], 'it stops at the failure instead of pushing the rest into a broken API')
+    assert.deepEqual(await adapter.send('P1', ['one']), { kind: 'push', sent: 1 }, 'a send that works reports what it sent')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+await t('discord: stop() during sign-in cancels that start — no socket is left running', async () => {
+  const { createDiscordAdapter } = await import('../lib/adapters/discord.js')
+  const cfg = resolveConfig({ discord: { botToken: 'dtok', botTokenEnv: 'DSH_TEST_NO_DISCORD_TOKEN_RACE' } })
+  const realFetch = globalThis.fetch
+  const realWS = globalThis.WebSocket
+  const logs = []
+  let release
+  let calls = 0
+  globalThis.WebSocket = FakeSocket
+  globalThis.fetch = async () => {
+    calls++
+    // The first getMe() hangs, which is exactly the window the bug lived in.
+    if (calls === 1) return { ok: true, status: 200, text: async () => new Promise((resolve) => { release = () => resolve('{"id":"424242424242424242","username":"bridge"}') }) }
+    return { ok: true, status: 200, text: async () => '{"id":"424242424242424242","username":"bridge"}' }
+  }
+  const adapter = createDiscordAdapter(cfg, { bridge: {}, log: (m) => logs.push(String(m)) })
+  try {
+    FakeSocket.instances.length = 0
+    const starting = adapter.start()
+    await adapter.stop()          // a settings save lands while getMe() is in flight
+    release()
+    await starting
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(FakeSocket.instances.length, 0, 'the gateway never opened for an adapter nobody will stop again')
+    assert.ok(logs.some((l) => /stopped while signing in/.test(l)), 'the log says the start was cancelled')
+
+    // The guard must not strand a genuine restart.
+    await adapter.start()
+    assert.equal(FakeSocket.instances.length, 1, 'a later start() still connects')
+    FakeSocket.instances[0].emit({ op: 10, d: { heartbeat_interval: 45000 } })
+    assert.ok(FakeSocket.instances[0].last(2), 'and identifies normally')
+  } finally {
+    await adapter.stop()
+    globalThis.fetch = realFetch
+    globalThis.WebSocket = realWS
   }
 })
 

@@ -90,17 +90,29 @@ sibling `*Env` name (default shown) so you can keep secrets out of `settings.yam
 | Platform | Secret | Default env var |
 |---|---|---|
 | LINE | `line.channelAccessToken` | `LINE_CHANNEL_ACCESS_TOKEN` |
-| LINE | `line.channelSecret` | `LINE_CHANNEL_SECRET` |
+| LINE | `line.channelSecret` **(signing — required)** | `LINE_CHANNEL_SECRET` |
 | Telegram | `telegram.botToken` | `TELEGRAM_BOT_TOKEN` |
 | WhatsApp | `wa.accessToken` | `WHATSAPP_ACCESS_TOKEN` |
-| WhatsApp | `wa.appSecret` | `WHATSAPP_APP_SECRET` |
+| WhatsApp | `wa.appSecret` **(signing — required)** | `WHATSAPP_APP_SECRET` |
 | Discord | `discord.botToken` | `DISCORD_BOT_TOKEN` |
 | Messenger | `messenger.pageAccessToken` | `MESSENGER_PAGE_ACCESS_TOKEN` |
-| Messenger | `messenger.appSecret` | `MESSENGER_APP_SECRET` |
+| Messenger | `messenger.appSecret` **(signing — required)** | `MESSENGER_APP_SECRET` |
 
 Secret fields are marked `role('secret')` in the schema, so a remote `describe()`
 redacts them; the Settings page renders them as password boxes, and **a blank field
 never overwrites a stored token** — only a changed value is written.
+
+**The three signing secrets are not optional.** A webhook body states who sent it —
+that PSID / userId / waId *is* the bridge's allowlist — so the signature is the only
+thing separating "LINE sent this" from "someone found the URL". There is no
+"no secret = dev mode" any more: `start()` refuses to register the route at all
+without one, and the log says so (and what to fill in) instead of leaving a
+login-as-anyone endpoint quietly verified in the platform's dashboard. Telegram and
+Discord are unaffected — they dial out, so nothing is listening.
+
+Where to get them: LINE Developers → your channel → Messaging API → **Channel
+secret**; Meta App Dashboard → **Settings → Basic → App Secret** (same secret for
+Messenger and WhatsApp).
 
 ### Minimal examples
 
@@ -347,19 +359,21 @@ max-token / length notices, the truncation suffix, and every command reply
 
 ```powershell
 cd C:\Users\Supk\dsh
-node ./dsh-plugin-messaging/test/smoke.mjs   # 47 dependency-free tests
+node ./dsh-plugin-messaging/test/smoke.mjs   # 53 dependency-free tests
 ```
 
 Covers chunking (incl. the 2000-char Discord/Messenger limit), translation (fake fetch
 + cache + passthrough), commands, state, counter (incl. month roll), reply folding
 (real event shape), config resolution and the live volatile refs, the settings bundle's
 module contract and three-language string table, the Telegram allowlist, the
-`/access` + `/tools` paths, keep-open reconciliation — and for the two newest
-transports: the Discord gateway protocol against a stubbed socket (identify, heartbeat,
-resume, close 4014 downgrade, fatal close), Discord REST (bot User-Agent,
-`allowed_mentions`, 429 retry, DM cache), the Discord adapter's mention/bot/allowlist
-gates, and Messenger's signature check, webhook handshake, de-duplication and
-24-hour-tag retry.
+`/access` + `/tools` paths, keep-open reconciliation — and for the transports: the
+Discord gateway protocol against a stubbed socket (identify, heartbeat, resume, close
+4014 downgrade, fatal close), Discord REST (bot User-Agent, `allowed_mentions`, 429
+retry, DM cache), the Discord adapter's mention/bot/allowlist gates and its
+start/stop race, Messenger's signature check, webhook handshake, de-duplication and
+24-hour-tag retry, `deliver.js` (a refused live-status edit sends the whole reply
+instead of losing it; partial sends count only what landed), and the rule that no
+webhook adapter registers a route it cannot verify.
 
 ### Layout
 
@@ -373,6 +387,7 @@ lib/commands.js         slash-command parser + help
 lib/state.js            per-chat binding store (JSON, atomic)
 lib/counter.js          monthly counter (JSON, atomic, auto-roll)
 lib/reply.js            fold session events -> reply text
+lib/deliver.js          the last centimetre: live status -> plain send fallback, honest chunk counts
 lib/adapters/telegram.js   long-poll / webhook, Markdown, live status edits
 lib/adapters/line.js       push API, reply token, loading animation
 lib/adapters/whatsapp.js   Graph API Cloud API transport
@@ -395,6 +410,12 @@ test/smoke.mjs          smoke tests
   `plugin:dsh-plugin-messaging` (required by message format v4).
 - Secrets entered in the Settings page persist to `settings.yaml`; use the `*Env`
   fields to keep them in the environment instead.
+- Webhook channels (LINE, WhatsApp, Messenger) stay **shut** until their signing
+  secret is set — see [Secrets](#secrets). The log names the field to fill in.
+- Delivery is counted, not assumed: a channel reports how many chunks the platform
+  accepted, a refused Graph 503 fails the turn instead of reporting success, and a
+  live status whose final edit is refused falls back to sending the answer as a new
+  message. The monthly counter therefore matches what people actually received.
 - Text only on every platform: no attachments, reactions, buttons or carousels.
 - Discord needs the **Message Content Intent** switched on in the Developer Portal or
   the gateway closes 4014; the plugin then retries without that intent and logs that
